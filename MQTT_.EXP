@@ -93,7 +93,7 @@ END_FUNCTION_BLOCK
 (* @OBJECTFLAGS := '0, 8' *)
 (* @SYMFILEFLAGS := '2048' *)
 (*	This Function Block implements an MQTT Client
-	Version: 2.5
+	Version: 2.7
 	Supported:
 		CONNECT / DISCONNECT / PING (Keep Alive)
 		SUBSCRIBE / UNSUBSCRIBE (single topic)
@@ -262,9 +262,9 @@ IF q_xConnected THEN
 	AC_KeepAlive();
 
 	(* Handle Client Requests (copy input topic/message in local var in case more than one cycle is needed) *)
-	R_TRIG_Publish(CLK := i_xPublish);				IF R_TRIG_Publish.Q			THEN	sPublishTopic := i_sPublishTopic; sPublishMessage := i_sPublishMessage;	AC_SendPUBLISH();			END_IF
-	R_TRIG_Subscribe(CLK := i_xSubscribe);			IF R_TRIG_Subscribe.Q		THEN	sSubscribeTopic := i_sSubscribeTopic;											AC_SendSUBSCRIBE();		END_IF
-	R_TRIG_Unsubscribe(CLK := i_xUnsubscribe);		IF R_TRIG_Unsubscribe.Q	THEN	sUnsubscribeTopic := i_sUnsubscribeTopic;									AC_SendUNSUBSCRIBE();	END_IF
+	R_TRIG_Publish(CLK := i_xPublish AND q_xIDLE);				IF R_TRIG_Publish.Q			THEN	sPublishTopic := i_sPublishTopic; sPublishMessage := i_sPublishMessage;	AC_SendPUBLISH();			END_IF
+	R_TRIG_Subscribe(CLK := i_xSubscribe AND q_xIDLE);		IF R_TRIG_Subscribe.Q		THEN	sSubscribeTopic := i_sSubscribeTopic;											AC_SendSUBSCRIBE();		END_IF
+	R_TRIG_Unsubscribe(CLK := i_xUnsubscribe AND q_xIDLE);	IF R_TRIG_Unsubscribe.Q	THEN	sUnsubscribeTopic := i_sUnsubscribeTopic;									AC_SendUNSUBSCRIBE();	END_IF
 
 	(* Handle any incoming MQTT packet *)
 	diRecvResult := SysSockRecv(diSocket := diSocket, pbyBuffer := ADR(abInBuffer), diBufferSize := BUFFER_SIZE+1, diFlags := 0);
@@ -478,6 +478,7 @@ ELSE								(* Error *)
 	q_xError := TRUE;
 	q_wState := 2#1000100001;	(* Next step: Close Socket *)
 END_IF
+diSendResult := 0;
 diRecvResult := 0;
 END_ACTION
 
@@ -544,6 +545,7 @@ q_wState := 2#0011010000;
 (* PINGRESP OK *)
 IF abInBuffer[1] = 0 THEN
 	xAwaitingPINGRESP := FALSE;
+	xResetKeepAliveTimer := TRUE;
 	q_xError := FALSE;
 	q_wState := 2#0011010001;	(* Next Step: IDLE *)
 
@@ -552,6 +554,7 @@ ELSE
 	q_xError := TRUE;
 	q_wState := 2#1011010001;	(* Next Step: Close Soket since this is a protocol violation *)
 END_IF
+diSendResult := 0;
 diRecvResult := 0;
 END_ACTION
 
@@ -717,6 +720,7 @@ wRecvPacketIdentifier :=	SHL(	BYTE_TO_UINT(abInBuffer[2]), 8)	(* Packet Identifi
 IF wRecvPacketIdentifier = wSendPacketIdentifier						(* The variable header contains the Packet Identifier from the SUBSCRIBE Packet that is being acknowledged. *)
 AND abInBuffer[diRecvResult-1] < 16#80 THEN							(* should = 0x00 for QoS 0, 0x80 = error *)
 	xAwaitingSUBACK := FALSE;
+	xResetKeepAliveTimer := TRUE;
 	q_xError := FALSE;
 	q_wState := 2#0010010001;	(* Next Step: IDLE *)
 
@@ -730,6 +734,7 @@ ELSE
 	q_xError := TRUE;
 	q_wState := 2#1010010001;	(* Close Socket *)
 END_IF
+diSendResult := 0;
 diRecvResult := 0;
 END_ACTION
 
@@ -772,6 +777,7 @@ wRecvPacketIdentifier :=	SHL(	BYTE_TO_UINT(abInBuffer[2]), 8)	(* Packet Identifi
 (* Success *)
 IF wRecvPacketIdentifier = wSendPacketIdentifier THEN				(* The variable header contains the Packet Identifier of the UNSUBSCRIBE Packet that is being acknowledged. *)
 	xAwaitingUNSUBACK := FALSE;
+	xResetKeepAliveTimer := TRUE;
 	q_xError := FALSE;
 	q_wState := 2#0010110001;	(* Next Step: IDLE *)
 
@@ -781,6 +787,7 @@ ELSE
 	q_xError := TRUE;
 	q_wState := 2#1010110001;	(* Close Socket *)
 END_IF
+diSendResult := 0;
 diRecvResult := 0;
 END_ACTION
 
@@ -858,7 +865,7 @@ Notes:
 - Payload: it contains one or more length-prefixed fields, whose presence is determined by the flags in the variable header. These fields, if present, MUST appear in the order Client Identifier, Will Topic, Will Message, User Name, Password
 	- Client Identifier: each Client connecting to the Server has a unique ClientId. The ClientId MUST be present and MUST be the first field in the CONNECT packet payload.
 		The Server MUST allow ClientIds which are between 1 and 23 UTF-8 encoded bytes in length, and that contain only the characters "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ".
-		* The Server MAY allow ClientId’s that contain more than 23 encoded bytes. The Server MAY allow ClientId’s that contain characters not included in the list given above.
+		* The Server MAY allow ClientId?s that contain more than 23 encoded bytes. The Server MAY allow ClientId?s that contain characters not included in the list given above.
 		If the Client supplies a zero-byte ClientId, the Client MUST also set CleanSession to 1.
 		If the Client supplies a zero-byte ClientId with CleanSession set to 0, the Server MUST respond to the CONNECT Packet with a CONNACK return code 0x02 (Identifier rejected) and then close the Network Connection.
 		If the Server rejects the ClientId it MUST respond to the CONNECT Packet with a CONNACK return code 0x02 (Identifier rejected) and then close the Network Connection.
@@ -987,7 +994,6 @@ xAwaitingCONNACK := TRUE;				(* This starts the dedicated CONNECT timer, awaitin
 IF diSendResult = iSendIndexCount THEN
 	q_xConnected := TRUE;					(* If CONNECT request sent successfully, we can expect to be connected. If CONNACK is unsuccessfull, q_xConnected will be set to false again after timeout is reached. It is allowed to send PUBLISH before getting CONNACK. *)
 	tCOMtimeoutValue := t#0ms;				(* Stop any COM Timeout if connected, CONNECT timeout is running now. *)
-	xResetKeepAliveTimer := TRUE;			(* Sending CONNECT can be considered as sending an MQTT Control Packet Type, so we can reset the keep alive timer here. *)
 	FOR iSendIndexCount := 0 TO BUFFER_SIZE DO abInBuffer[iSendIndexCount] := 0; END_FOR	(* Purge In Buffer on connection *)
 	q_sLog := 'Sending CONNECT successfully, waiting for CONNACK from Broker';
 	q_xError := FALSE;
@@ -998,8 +1004,8 @@ ELSE
 	q_sLog := 'Sending CONNECT failed';
 	q_xError := TRUE;
 	q_wState := 2#1100011001;				(* Next Step: Do not close the connection yet. It will be retried. And if Timeout is reached by not receiving CONNACK, the connection will be closed. *)
+	diSendResult := 0;
 END_IF
-diSendResult := 0;
 END_ACTION
 
 ACTION	AC_SendDISCONNECT:
@@ -1046,7 +1052,6 @@ xAwaitingUNSUBACK := FALSE;
 IF diSendResult = 2 THEN
 	q_sLog := 'Sending DISCONNECT successfully';
 	q_xError := FALSE;
-	xResetKeepAliveTimer := TRUE;		(* Sending DISCONNECT can be considered as sending an MQTT Control Packet Type, so we can reset the keep alive timer here *)
 	q_wState := 2#0111100001;			(* Next Step: Close Socket *)
 
 (* Send DISCONNECT failed *)
@@ -1085,6 +1090,8 @@ Notes:
 	It is the responsibility of the Client to ensure that the interval between Control Packets being sent does not exceed the Keep Alive value. In the absence of sending any other Control Packets, the Client MUST send a PINGREQ Packet [MQTT-3.1.2-23].
 *)
 
+IF NOT q_xIDLE THEN RETURN; END_IF	(* do not send anything while awaiting an ACK packet *)
+
 q_sLog := 'Sending PINGREQ to Broker';
 q_wState := 2#0111000000;
 
@@ -1105,15 +1112,14 @@ IF diSendResult = 2 THEN
 	q_sLog := 'Sending PINGREQ successfully';
 	q_xError := FALSE;
 	q_wState := 2#0111000001;	(* Next Step: IDLE, wait for PINGRESP *)
-	xResetKeepAliveTimer := TRUE;
 
 (* Send PINGREQ failed *)
 ELSE
 	q_sLog := 'Sending PINGREQ failed';
 	q_xError := TRUE;
 	q_wState := 2#1111000001;	(* Next Step: retry until timeout *)
+	diSendResult := 0;
 END_IF
-diSendResult := 0;
 END_ACTION
 
 ACTION	AC_SendPUBLISH:
@@ -1136,6 +1142,8 @@ Notes:
   When a new subscription is established, the last retained message, if any, on each matching topic name MUST be sent to the subscriber [MQTT-3.3.1-6].
 - The Topic Name in the PUBLISH Packet MUST NOT contain wildcard characters [MQTT-3.3.2-2].
 *)
+
+IF NOT q_xIDLE THEN RETURN; END_IF	(* do not send anything while awaiting an ACK packet *)
 
 q_sLog := CONCAT(CONCAT('Sending PUBLISH to Broker (d0, q0, r', BYTE_TO_STRING(BOOL_TO_BYTE(i_xRetain))), ', m0)');
 q_wState := 2#0100110000;
@@ -1184,7 +1192,6 @@ IF diSendResult = iSendIndexCount THEN
 	q_sLog := CONCAT(CONCAT('Sending PUBLISH to Broker (d0, q0, r', BYTE_TO_STRING(BOOL_TO_BYTE(i_xRetain))), ', m0) successfully');
 	q_xError := FALSE;
 	q_wState := 2#0100110001;	(* Next Step: IDLE *)
-	xResetKeepAliveTimer := TRUE;
 
 (* Send PUBLISH failed *)
 ELSE
@@ -1215,6 +1222,8 @@ Notes:
 
 TODO: multiple topics subscription?
 *)
+
+IF NOT q_xIDLE THEN RETURN; END_IF	(* do not send anything while awaiting an ACK packet *)
 
 q_sLog := 'Sending SUBSCRIBE to Broker';
 q_wState := 2#0110000000;
@@ -1267,15 +1276,14 @@ IF diSendResult = iSendIndexCount THEN
 	q_sLog := 'Sending SUBSCRIBE successfully';
 	q_xError := FALSE;
 	q_wState := 2#0110000001;	(* Next Step: IDLE (Wait for SUBACK) *)
-	xResetKeepAliveTimer := TRUE;
 
 (* Send SUBSCRIBE failed *)
 ELSE
 	q_sLog := 'Sending SUBSCRIBE failed';
 	q_xError := TRUE;
 	q_wState := 2#1110000001;	(* Next Step: no retry for QoS0 (IDLE) *)
+	diSendResult := 0;
 END_IF
-diSendResult := 0;
 END_ACTION
 
 ACTION	AC_SendUNSUBSCRIBE:
@@ -1298,6 +1306,8 @@ Notes:
 
 TODO: multiple topics unsubscription?
 *)
+
+IF NOT q_xIDLE THEN RETURN; END_IF	(* do not send anything while awaiting an ACK packet *)
 
 q_sLog := 'Sending UNSUBSCRIBE to Broker';
 q_wState := 2#0110100000;
@@ -1347,15 +1357,14 @@ IF diSendResult = iSendIndexCount THEN
 	q_sLog := 'Sending UNSUBSCRIBE successfully';
 	q_xError := FALSE;
 	q_wState := 2#0110100001;	(* Next Step: IDLE (Wait for UNSUBACK) *)
-	xResetKeepAliveTimer := TRUE;
 
 (* Send UNSUBSCRIBE failed *)
 ELSE
 	q_sLog := 'Sending UNSUBSCRIBE failed';
 	q_xError := TRUE;
 	q_wState := 2#1110100001;	(* Next Step: no retry for QoS0 (IDLE) *)
+	diSendResult := 0;
 END_IF
-diSendResult := 0;
 END_ACTION
 
 ACTION	AC_TimeoutCONNECT:
@@ -1368,6 +1377,7 @@ Notes:
 
 fbTimeoutCONNECT(IN := xAwaitingCONNACK, PT := i_tCommTimeout);
 IF fbTimeoutCONNECT.Q THEN
+	diSendResult := 0;
 	q_sLog := 'CONNECT Timeout, CONNACK not received';
 	q_xError := TRUE;
 	q_wState := 2#1100010111;	(* Next Step: Close Socket *)
@@ -1386,6 +1396,7 @@ fbTimeoutPINGREQ(IN := xAwaitingPINGRESP, PT := i_tCommTimeout);
 
 (* PINGREQ Timeout *)
 IF fbTimeoutPINGREQ.Q THEN
+	diSendResult := 0;
 	q_sLog := 'PINGREQ Timeout, PINGRESP not received';
 	q_xError := TRUE;
 	q_wState := 2#1111000010;	(* Next Step: Close Socket *)
@@ -1399,6 +1410,7 @@ ACTION	AC_TimeoutSUBSCRIBE:
 
 fbTimeoutSUBSCRIBE(IN := xAwaitingSUBACK, PT := i_tCommTimeout);
 IF fbTimeoutSUBSCRIBE.Q THEN
+	diSendResult := 0;
 	q_sLog := 'SUBSCRIBE Timeout, SUBACK not received';
 	q_xError := TRUE;
 	q_wState := 2#1110000010;	(* Next Step: Disconnect *)
@@ -1416,6 +1428,7 @@ Notes:
 
 fbTimeoutUNSUBSCRIBE(IN := xAwaitingUNSUBACK, PT := i_tCommTimeout);
 IF fbTimeoutUNSUBSCRIBE.Q THEN
+	diSendResult := 0;
 	q_sLog := 'UNSUBSCRIBE Timeout, UNSUBACK not received';
 	q_xError := TRUE;
 	q_wState := 2#1110100010;	(* Next Step: Disconnect *)
